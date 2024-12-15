@@ -35,6 +35,8 @@ dependencies = [
   "pdfminer.six",
   "puremagic",
   "pydub",
+  "pyyaml",
+  "sqlparse",
   "youtube-transcript-api",
   "SpeechRecognition",
   "pathvalidate",

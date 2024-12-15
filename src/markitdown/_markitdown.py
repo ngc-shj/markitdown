@@ -1,19 +1,25 @@
 # type: ignore
 import base64
 import binascii
+from collections import defaultdict
 import copy
+from dataclasses import dataclass
+import hashlib
 import html
 import json
 import mimetypes
 import os
+import yaml
 import re
 import shutil
+import sqlparse
 import subprocess
 import sys
 import tempfile
 import traceback
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import parse_qs, quote, unquote, urlparse, urlunparse
+import xml.etree.ElementTree as ET
 
 import mammoth
 import markdownify
@@ -837,6 +843,593 @@ class ImageConverter(MediaConverter):
         return response.choices[0].message.content
 
 
+class JsonConverter(DocumentConverter):
+    """Converts JSON files to a readable Markdown format"""
+    
+    def convert(self, local_path: str, **kwargs) -> Union[None, DocumentConverterResult]:
+        extension = kwargs.get("file_extension", "")
+        if extension.lower() != ".json":
+            return None
+            
+        try:
+            with open(local_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            md_content = "# JSON Contents\n\n"
+            md_content += self._json_to_markdown(data)
+            
+            return DocumentConverterResult(
+                title="JSON Document",
+                text_content=md_content
+            )
+        except json.JSONDecodeError:
+            return None
+            
+    def _json_to_markdown(self, data, level=0):
+        md = ""
+        indent = "  " * level
+        
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if isinstance(value, (dict, list)):
+                    md += f"{indent}- **{key}**:\n{self._json_to_markdown(value, level+1)}"
+                else:
+                    md += f"{indent}- **{key}**: {value}\n"
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, (dict, list)):
+                    md += f"{indent}-\n{self._json_to_markdown(item, level+1)}"
+                else:
+                    md += f"{indent}- {item}\n"
+        return md
+
+
+class EnhancedCsvConverter(DocumentConverter):
+    """Converts CSV files to Markdown tables with comprehensive data analysis"""
+    
+    def convert(self, local_path: str, **kwargs) -> Union[None, DocumentConverterResult]:
+        extension = kwargs.get("file_extension", "")
+        if extension.lower() != ".csv":
+            return None
+            
+        try:
+            # Use pandas for data analysis
+            import pandas as pd
+            df = pd.read_csv(local_path)
+            
+            md_content = "# CSV Analysis\n\n"
+            
+            # Basic dataset information
+            md_content += "## Summary Statistics\n\n"
+            md_content += f"- Total Rows: {len(df)}\n"
+            md_content += f"- Total Columns: {len(df.columns)}\n"
+            md_content += f"- Column Names: {', '.join(df.columns)}\n\n"
+
+            # Detailed analysis for each column
+            md_content += "## Column Analysis\n\n"
+            for column in df.columns:
+                md_content += f"### {column}\n\n"
+                
+                # Handle numeric data
+                if pd.api.types.is_numeric_dtype(df[column]):
+                    md_content += f"- Type: Numeric\n"
+                    md_content += f"- Mean: {df[column].mean():.2f}\n"
+                    md_content += f"- Median: {df[column].median():.2f}\n"
+                    md_content += f"- Std Dev: {df[column].std():.2f}\n"
+                    md_content += f"- Min: {df[column].min()}\n"
+                    md_content += f"- Max: {df[column].max()}\n"
+                # Handle datetime data
+                elif pd.api.types.is_datetime64_any_dtype(df[column]):
+                    md_content += f"- Type: DateTime\n"
+                    md_content += f"- Earliest: {df[column].min()}\n"
+                    md_content += f"- Latest: {df[column].max()}\n"
+                # Handle other data types (categorical, text, etc.)
+                else:
+                    md_content += f"- Type: {df[column].dtype}\n"
+                    md_content += f"- Unique Values: {df[column].nunique()}\n"
+                    # Show top 5 most frequent values
+                    value_counts = df[column].value_counts().head()
+                    if not value_counts.empty:
+                        md_content += "- Top Values:\n"
+                        for val, count in value_counts.items():
+                            md_content += f"  - {val}: {count} times\n"
+                
+                md_content += "\n"
+
+            # Data preview section
+            preview_rows = 5  # Default number of rows to show at start and end
+            
+            md_content += "## Data Preview\n\n"
+            md_content += "### First {} Rows\n\n".format(preview_rows)
+            
+            # Add table headers
+            md_content += "| " + " | ".join(df.columns) + " |\n"
+            md_content += "| " + " | ".join(["---"] * len(df.columns)) + " |\n"
+            
+            # Show first n rows
+            for _, row in df.head(preview_rows).iterrows():
+                md_content += "| " + " | ".join(str(val) for val in row) + " |\n"
+            
+            # For large datasets, also show the last few rows
+            if len(df) > preview_rows * 2:
+                md_content += "\n### Last {} Rows\n\n".format(preview_rows)
+                
+                # Repeat headers for the bottom section
+                md_content += "| " + " | ".join(df.columns) + " |\n"
+                md_content += "| " + " | ".join(["---"] * len(df.columns)) + " |\n"
+                
+                # Show last n rows
+                for _, row in df.tail(preview_rows).iterrows():
+                    md_content += "| " + " | ".join(str(val) for val in row) + " |\n"
+            
+            # Add note for truncated data
+            if len(df) > preview_rows * 2:
+                total_shown = preview_rows * 2
+                md_content += f"\n*Note: Showing {total_shown} rows out of {len(df)} total rows*\n"
+            
+            return DocumentConverterResult(
+                title="CSV Analysis",
+                text_content=md_content
+            )
+        except Exception as e:
+            # Log error and delegate to other converters if available
+            print(f"Error in CSV conversion: {str(e)}")
+            return None
+
+
+class XmlConverter(DocumentConverter):
+    """Converts XML files to a structured Markdown format"""
+    
+    def convert(self, local_path: str, **kwargs) -> Union[None, DocumentConverterResult]:
+        extension = kwargs.get("file_extension", "")
+        if extension.lower() != ".xml":
+            return None
+            
+        try:
+            tree = ET.parse(local_path)
+            root = tree.getroot()
+            
+            md_content = "# XML Document Structure\n\n"
+            md_content += self._element_to_markdown(root)
+            
+            return DocumentConverterResult(
+                title="XML Document",
+                text_content=md_content
+            )
+        except ET.ParseError:
+            return None
+            
+    def _element_to_markdown(self, element, level=0):
+        indent = "  " * level
+        md = f"{indent}- Element: **{element.tag}**\n"
+        
+        # Add attributes if any
+        if element.attrib:
+            md += f"{indent}  Attributes:\n"
+            for key, value in element.attrib.items():
+                md += f"{indent}    - {key}: {value}\n"
+        
+        # Add text content if any
+        if element.text and element.text.strip():
+            md += f"{indent}  Text: {element.text.strip()}\n"
+        
+        # Process child elements
+        for child in element:
+            md += self._element_to_markdown(child, level + 1)
+            
+        return md
+
+
+class YamlConverter(DocumentConverter):
+    """Converts YAML files to a readable Markdown format"""
+    
+    def convert(self, local_path: str, **kwargs) -> Union[None, DocumentConverterResult]:
+        # Check if this is a YAML file
+        extension = kwargs.get("file_extension", "")
+        if extension.lower() not in [".yaml", ".yml"]:
+            return None
+            
+        try:
+            with open(local_path, 'r', encoding='utf-8') as f:
+                # Load all documents in the YAML file
+                docs = list(yaml.safe_load_all(f))
+            
+            # Start building markdown content
+            md_content = ""
+            
+            # Handle multiple documents in the YAML file
+            if len(docs) > 1:
+                for i, doc in enumerate(docs, 1):
+                    md_content += f"# Document {i}\n\n"
+                    md_content += self._detect_and_format_yaml(doc)
+                    md_content += "\n---\n\n"  # Document separator
+            else:
+                doc = docs[0]
+                md_content = self._detect_and_format_yaml(doc)
+            
+            return DocumentConverterResult(
+                title="YAML Document",
+                text_content=md_content
+            )
+        except yaml.YAMLError:
+            return None
+    
+    def _detect_and_format_yaml(self, data: Any) -> str:
+        """Detect common YAML formats and apply appropriate formatting"""
+        
+        # Detect Kubernetes manifest
+        if isinstance(data, dict) and all(k in data for k in ['apiVersion', 'kind', 'metadata']):
+            return self._format_kubernetes_manifest(data)
+        
+        # Detect Docker Compose
+        elif isinstance(data, dict) and 'services' in data:
+            return self._format_docker_compose(data)
+        
+        # Detect Ansible playbook
+        elif isinstance(data, list) and all(isinstance(item, dict) and 'name' in item for item in data):
+            return self._format_ansible_playbook(data)
+        
+        # Default formatting for general YAML
+        else:
+            return self._yaml_to_markdown(data)
+    
+    def _format_kubernetes_manifest(self, data: Dict) -> str:
+        """Special formatting for Kubernetes manifests"""
+        md = f"# Kubernetes {data['kind']}\n\n"
+        md += f"- **API Version:** {data['apiVersion']}\n"
+        md += f"- **Kind:** {data['kind']}\n"
+        md += f"- **Name:** {data['metadata'].get('name', 'N/A')}\n"
+        md += f"- **Namespace:** {data['metadata'].get('namespace', 'default')}\n\n"
+        
+        # Add other sections
+        for key, value in data.items():
+            if key not in ['apiVersion', 'kind', 'metadata']:
+                md += f"## {key}\n\n"
+                md += self._yaml_to_markdown(value, level=0)
+                md += "\n"
+        
+        return md
+    
+    def _format_docker_compose(self, data: Dict) -> str:
+        """Special formatting for Docker Compose files"""
+        md = "# Docker Compose Configuration\n\n"
+        
+        if 'version' in data:
+            md += f"**Version:** {data['version']}\n\n"
+        
+        md += "## Services\n\n"
+        for service_name, config in data['services'].items():
+            md += f"### {service_name}\n\n"
+            md += self._yaml_to_markdown(config, level=0)
+            md += "\n"
+        
+        # Add other top-level sections
+        for key, value in data.items():
+            if key not in ['version', 'services']:
+                md += f"## {key}\n\n"
+                md += self._yaml_to_markdown(value, level=0)
+                md += "\n"
+        
+        return md
+    
+    def _format_ansible_playbook(self, data: List) -> str:
+        """Special formatting for Ansible playbooks"""
+        md = "# Ansible Playbook\n\n"
+        
+        for task in data:
+            md += f"## Task: {task['name']}\n\n"
+            task_copy = task.copy()
+            task_copy.pop('name', None)  # Remove name as it's already in the header
+            md += self._yaml_to_markdown(task_copy, level=0)
+            md += "\n"
+        
+        return md
+    
+    def _yaml_to_markdown(self, data: Any, level: int = 0) -> str:
+        """Convert YAML data to Markdown with proper formatting"""
+        md = ""
+        indent = "  " * level
+        
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if isinstance(value, (dict, list)):
+                    md += f"{indent}- **{key}**:\n{self._yaml_to_markdown(value, level+1)}"
+                else:
+                    md += f"{indent}- **{key}**: {value}\n"
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, (dict, list)):
+                    md += f"{indent}-\n{self._yaml_to_markdown(item, level+1)}"
+                else:
+                    md += f"{indent}- {item}\n"
+        return md
+
+
+@dataclass
+class TableStructure:
+    """Represents a database table structure"""
+    name: str
+    columns: List[Dict[str, str]]
+    primary_keys: List[str]
+    foreign_keys: List[Dict[str, List[str]]]
+
+
+class SqlConverter(DocumentConverter):
+    """Converts SQL files to readable Markdown format."""
+
+    def convert(self, local_path: str, **kwargs: Any) -> Union[None, DocumentConverterResult]:
+        """Convert SQL file to Markdown."""
+        extension = kwargs.get("file_extension", "")
+        if extension.lower() != ".sql":
+            return None
+
+        try:
+            with open(local_path, "rt", encoding="utf-8") as sql_file:
+                content = sql_file.read()
+                return self._convert_sql_to_markdown(content)
+        except Exception as e:
+            return DocumentConverterResult(
+                title="SQL File",
+                text_content=f"Error converting SQL file: {str(e)}"
+            )
+
+    def _convert_sql_to_markdown(self, sql_content: str) -> DocumentConverterResult:
+        """Convert SQL content to Markdown format."""
+        markdown_content = ["# SQL File Contents\n"]
+        
+        statements = sqlparse.parse(sql_content)
+        for i, statement in enumerate(statements, 1):
+            if not statement.tokens:
+                continue
+
+            statement_type = statement.get_type() or "Statement"
+            markdown_content.append(f"## {statement_type} {i}\n")
+
+            # Format SQL
+            formatted_sql = self._format_statement(statement)
+            markdown_content.append(f"```sql\n{formatted_sql}\n```\n")
+
+            # Add table documentation for CREATE statements
+            if statement.get_type() == "CREATE":
+                table_structure = self._parse_create_table(statement)
+                if table_structure:
+                    doc = self._format_table_structure(table_structure)
+                    markdown_content.append(f"{doc}\n")
+
+        return DocumentConverterResult(
+            title="SQL Documentation",
+            text_content='\n'.join(markdown_content).strip()
+        )
+
+    def _format_statement(self, statement: sqlparse.sql.Statement) -> str:
+        """Format SQL statement with proper indentation."""
+        sql_str = str(statement)
+        comment = ""
+
+        # Extract comment if present
+        if '--' in sql_str:
+            parts = sql_str.split('--', 1)
+            sql_str = parts[0].strip()
+            comment = f"-- {parts[1].strip()}\n"
+
+        if sql_str.upper().startswith('CREATE TABLE'):
+            return comment + self._format_create_table(sql_str)
+        elif sql_str.upper().startswith('SELECT'):
+            return comment + self._format_select(sql_str)
+        else:
+            return comment + sqlparse.format(sql_str, reindent=True, 
+                                          keyword_case='upper', identifier_case='lower')
+
+    def _format_create_table(self, sql: str) -> str:
+        """Format CREATE TABLE statement."""
+        # Normalize whitespace
+        sql = ' '.join(sql.split())
+        
+        # Extract table name and body
+        match = re.match(
+            r"CREATE\s+TABLE\s+(\w+)\s*\((.*)\)",
+            sql,
+            re.IGNORECASE | re.DOTALL
+        )
+        if not match:
+            return sql
+
+        table_name = match.group(1)
+        definitions = self._split_definitions(match.group(2))
+        
+        # Separate columns and constraints
+        columns = []
+        constraints = []
+        for d in definitions:
+            if d.upper().startswith(('PRIMARY KEY', 'FOREIGN KEY', 'CONSTRAINT')):
+                constraints.append(d)
+            else:
+                columns.append(d)
+
+        # Build formatted output
+        lines = [f"CREATE TABLE {table_name} ("]
+        
+        # Add columns
+        for col in columns:
+            lines.append(f"    {col},")
+        
+        # Add constraints
+        if constraints:
+            if columns:  # Add blank line if we have both columns and constraints
+                lines[-1] = lines[-1]  # Keep the comma
+                lines.append("")
+            
+            for i, constraint in enumerate(constraints):
+                comma = ',' if i < len(constraints) - 1 else ''
+                lines.append(f"    {constraint}{comma}")
+        
+        lines.append(");")
+        
+        return '\n'.join(lines)
+
+    def _split_definitions(self, body: str) -> List[str]:
+        """Split column/constraint definitions handling nested parentheses."""
+        definitions = []
+        current = []
+        depth = 0
+        
+        for char in body + ',':
+            if char == '(':
+                depth += 1
+            elif char == ')':
+                depth -= 1
+                
+            if char == ',' and depth == 0:
+                if current:
+                    definitions.append(''.join(current).strip())
+                current = []
+            else:
+                current.append(char)
+                
+        return definitions
+
+    def _format_select(self, sql: str) -> str:
+        """Format SELECT statement."""
+        return sqlparse.format(
+            sql,
+            reindent=True,
+            keyword_case='upper',
+            identifier_case='lower'
+        )
+
+    def _parse_create_table(self, statement: sqlparse.sql.Statement) -> Optional[TableStructure]:
+        """Extract table structure from CREATE TABLE statement."""
+        sql_str = str(statement)
+        
+        # Parse table name and body
+        match = re.search(
+            r"CREATE\s+TABLE\s+([^\s(]+)\s*\((.*)\)",
+            sql_str,
+            re.IGNORECASE | re.DOTALL
+        )
+        if not match:
+            return None
+
+        table_name = match.group(1).strip('`"[]')
+        definitions = self._split_definitions(match.group(2))
+
+        # Parse definitions
+        columns = []
+        primary_keys = []
+        foreign_keys = []
+
+        for defn in definitions:
+            defn = defn.strip()
+            
+            # Skip empty definitions
+            if not defn:
+                continue
+
+            # Extract primary key constraint
+            if "PRIMARY KEY" in defn.upper():
+                pk_match = re.search(r"PRIMARY\s+KEY\s*\(([^)]+)\)", defn, re.IGNORECASE)
+                if pk_match:
+                    primary_keys.extend(
+                        [col.strip() for col in pk_match.group(1).split(',')]
+                    )
+                continue
+
+            # Extract foreign key constraint
+            if "FOREIGN KEY" in defn.upper():
+                fk_match = re.search(
+                    r"FOREIGN\s+KEY\s*\(([^)]+)\)\s+REFERENCES\s+([^\s(]+)\s*\(([^)]+)\)",
+                    defn,
+                    re.IGNORECASE
+                )
+                if fk_match:
+                    foreign_keys.append({
+                        'columns': [col.strip() for col in fk_match.group(1).split(',')],
+                        'reference_table': fk_match.group(2).strip('`"[]'),
+                        'reference_columns': [col.strip() for col in fk_match.group(3).split(',')]
+                    })
+                continue
+
+            # Parse regular column definition
+            col_match = re.search(r"(\S+)\s+([^,]+)", defn)
+            if col_match:
+                name = col_match.group(1).strip('`"[]')
+                definition = col_match.group(2).strip()
+                
+                # Skip if this is part of a constraint
+                if name.upper() in ['PRIMARY', 'FOREIGN', 'CONSTRAINT']:
+                    continue
+
+                # Add inline primary key to primary_keys list
+                if 'PRIMARY KEY' in definition.upper():
+                    primary_keys.append(name)
+
+                columns.append({
+                    'name': name,
+                    'definition': definition,
+                    'nullable': 'NOT NULL' not in definition.upper()
+                })
+
+        return TableStructure(
+            name=table_name,
+            columns=columns,
+            primary_keys=primary_keys,
+            foreign_keys=foreign_keys
+        )
+
+    def _format_table_structure(self, table: TableStructure) -> str:
+        """Format table structure documentation."""
+        md = []
+        
+        # Column information table
+        md.append("\n| Column | Type | Required | Key | Description |")
+        md.append("|--------|------|----------|-----|-------------|")
+        
+        for col in table.columns:
+            name = col['name']
+            
+            # Extract base type
+            type_match = re.match(r'^(\w+(?:\s*\([^)]+\))?)', col['definition'])
+            type_str = type_match.group(1) if type_match else col['definition']
+            
+            # Required indicator
+            required = "✓" if not col['nullable'] else ""
+            
+            # Key information
+            keys = []
+            if name in table.primary_keys:
+                keys.append("🔑")
+            if any(name in fk['columns'] for fk in table.foreign_keys):
+                keys.append("🔗")
+            key_str = " ".join(keys)
+            
+            # Description including constraints
+            desc_parts = []
+            
+            # Default value
+            default_match = re.search(r'DEFAULT\s+([^,\s]+)', col['definition'], re.IGNORECASE)
+            if default_match:
+                desc_parts.append(f"Default: {default_match.group(1)}")
+            
+            # Check constraint
+            check_match = re.search(r'CHECK\s*\(([^)]+)\)', col['definition'], re.IGNORECASE)
+            if check_match:
+                desc_parts.append(f"Check: {check_match.group(1)}")
+            
+            desc_str = ", ".join(desc_parts)
+            
+            md.append(f"| {name} | {type_str} | {required} | {key_str} | {desc_str} |")
+        
+        # Foreign key relationships
+        if table.foreign_keys:
+            md.append("\n#### Foreign Key Relationships\n")
+            for fk in table.foreign_keys:
+                md.append(f"* {', '.join(fk['columns'])} → "
+                         f"{fk['reference_table']} "
+                         f"({', '.join(fk['reference_columns'])})")
+
+        return "\n".join(md)
+
+
 class FileConversionException(BaseException):
     pass
 
@@ -880,6 +1473,12 @@ class MarkItDown:
         self.register_page_converter(Mp3Converter())
         self.register_page_converter(ImageConverter())
         self.register_page_converter(PdfConverter())
+        # 
+        self.register_page_converter(EnhancedCsvConverter())
+        self.register_page_converter(JsonConverter())
+        self.register_page_converter(SqlConverter())
+        self.register_page_converter(XmlConverter())
+        self.register_page_converter(YamlConverter())
 
     def convert(
         self, source: Union[str, requests.Response], **kwargs: Any
@@ -1099,3 +1698,4 @@ class MarkItDown:
     def register_page_converter(self, converter: DocumentConverter) -> None:
         """Register a page text converter."""
         self._page_converters.insert(0, converter)
+
